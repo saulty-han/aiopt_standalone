@@ -52,7 +52,16 @@ class RAGStore:
         self.embedder_name = embedder_name
         self._embeddings = np.zeros((0, self.dim), dtype=np.float32)
         self._types = np.zeros((0,), dtype=np.int8)
-        self._qconfigs: List[QConfig] = []  # parallel to rows
+        # Deduplicated QConfig metadata. Each QConfig is stored once even though
+        # it contributes one embedding row per schematic type. ``_qc_index[r]``
+        # is the index into ``_qconfigs`` for embedding row ``r``.
+        self._qconfigs: List[QConfig] = []
+        self._qc_index = np.zeros((0,), dtype=np.int64)
+        # qconfig_id -> position in ``_qconfigs`` (for dedup on add).
+        self._id_to_pos: Dict[str, int] = {}
+
+    def _qconfig_for_row(self, row: int) -> QConfig:
+        return self._qconfigs[int(self._qc_index[row])]
 
     # ------------------------------------------------------------------
     # Stats
@@ -63,7 +72,7 @@ class RAGStore:
 
     @property
     def num_qconfigs(self) -> int:
-        return len({q.qconfig_id for q in self._qconfigs})
+        return len(self._qconfigs)
 
     # ------------------------------------------------------------------
     # Mutation
@@ -72,23 +81,33 @@ class RAGStore:
         self,
         rows: Sequence[Tuple[QConfig, SchematicType, np.ndarray]],
     ) -> int:
-        """Append (qconfig, schematic_type, vector) rows. Returns rows added."""
+        """Append (qconfig, schematic_type, vector) rows. Returns rows added.
+
+        QConfig metadata is deduplicated by ``qconfig_id``: the first time an id
+        is seen it is appended to ``_qconfigs``; later rows for the same id only
+        store a new embedding row pointing at the existing metadata entry.
+        """
         if not rows:
             return 0
         vecs = []
         types = []
-        qcs: List[QConfig] = []
+        qc_idx = []
         for qc, stype, vec in rows:
             v = np.asarray(vec, dtype=np.float32).reshape(-1)
             if v.shape[0] != self.dim:
                 raise ValueError(f"vector dim {v.shape[0]} != store dim {self.dim}")
+            pos = self._id_to_pos.get(qc.qconfig_id)
+            if pos is None:
+                pos = len(self._qconfigs)
+                self._qconfigs.append(qc)
+                self._id_to_pos[qc.qconfig_id] = pos
             vecs.append(v)
             types.append(_TYPE_TO_CODE[stype])
-            qcs.append(qc)
+            qc_idx.append(pos)
         self._embeddings = np.vstack([self._embeddings, np.array(vecs, dtype=np.float32)])
         self._types = np.concatenate([self._types, np.array(types, dtype=np.int8)])
-        self._qconfigs.extend(qcs)
-        return len(qcs)
+        self._qc_index = np.concatenate([self._qc_index, np.array(qc_idx, dtype=np.int64)])
+        return len(vecs)
 
     def upsert(
         self,
@@ -102,8 +121,8 @@ class RAGStore:
         if not rows:
             return 0
         existing = {
-            (q.qconfig_id, int(self._types[i]))
-            for i, q in enumerate(self._qconfigs)
+            (self._qconfig_for_row(r).qconfig_id, int(self._types[r]))
+            for r in range(self.num_rows)
         }
         fresh = [
             (qc, stype, vec)
@@ -144,7 +163,7 @@ class RAGStore:
         # argpartition for top-k then sort that slice descending
         part = np.argpartition(-sims, k - 1)[:k]
         order = part[np.argsort(-sims[part])]
-        return [(self._qconfigs[int(idxs[j])], float(sims[j])) for j in order]
+        return [(self._qconfig_for_row(int(idxs[j])), float(sims[j])) for j in order]
 
     # ------------------------------------------------------------------
     # Persistence
@@ -162,13 +181,19 @@ class RAGStore:
             "num_qconfigs": int(self.num_qconfigs),
         }
 
-        # embeddings.npz
+        # embeddings.npz — vectors, per-row schematic type, and the per-row
+        # index into the deduplicated qconfigs list.
         emb_tmp = target / "embeddings.npz.tmp"
         with emb_tmp.open("wb") as fh:
-            np.savez_compressed(fh, embeddings=self._embeddings, types=self._types)
+            np.savez_compressed(
+                fh,
+                embeddings=self._embeddings,
+                types=self._types,
+                qc_index=self._qc_index,
+            )
         emb_tmp.replace(target / "embeddings.npz")
 
-        # qconfigs.jsonl
+        # qconfigs.jsonl — one row per DISTINCT QConfig (no duplication).
         qc_tmp = target / "qconfigs.jsonl.tmp"
         with qc_tmp.open("w", encoding="utf-8") as fh:
             for qc in self._qconfigs:
@@ -205,6 +230,7 @@ class RAGStore:
             with np.load(emb_path) as data:
                 store._embeddings = data["embeddings"].astype(np.float32)
                 store._types = data["types"].astype(np.int8)
+                qc_index = data["qc_index"].astype(np.int64) if "qc_index" in data else None
             qcs: List[QConfig] = []
             with qc_path.open("r", encoding="utf-8") as fh:
                 for line in fh:
@@ -212,11 +238,33 @@ class RAGStore:
                     if not line:
                         continue
                     qcs.append(QConfig(**json.loads(line)))
+
+            n_rows = store._embeddings.shape[0]
+            if qc_index is None:
+                # Legacy store (pre-dedup): qconfigs.jsonl was parallel to rows.
+                # Deduplicate in-memory and rebuild the index mapping.
+                if len(qcs) != n_rows:
+                    logger.warning(
+                        f"[RAG] legacy store row/qconfig mismatch: {n_rows} vs {len(qcs)}"
+                    )
+                qc_index = np.zeros((len(qcs),), dtype=np.int64)
+                deduped: List[QConfig] = []
+                id_to_pos: Dict[str, int] = {}
+                for r, qc in enumerate(qcs):
+                    pos = id_to_pos.get(qc.qconfig_id)
+                    if pos is None:
+                        pos = len(deduped)
+                        deduped.append(qc)
+                        id_to_pos[qc.qconfig_id] = pos
+                    qc_index[r] = pos
+                qcs = deduped
+
             store._qconfigs = qcs
-            if store._embeddings.shape[0] != len(qcs):
+            store._qc_index = qc_index
+            store._id_to_pos = {qc.qconfig_id: i for i, qc in enumerate(qcs)}
+            if qc_index.shape[0] != n_rows:
                 logger.warning(
-                    f"[RAG] store row/qconfig mismatch: "
-                    f"{store._embeddings.shape[0]} vs {len(qcs)}"
+                    f"[RAG] store row/index mismatch: rows={n_rows} qc_index={qc_index.shape[0]}"
                 )
             logger.info(
                 f"[RAG] store loaded path={path} rows={store.num_rows} "
