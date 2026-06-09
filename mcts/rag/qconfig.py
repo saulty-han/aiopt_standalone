@@ -21,12 +21,35 @@ import hashlib
 from typing import Any, Dict, List, Optional
 
 from mcts.rag.types import QConfig
+from mcts.rag.schematic import normalize_sql
 from mcts.utils.hint_utils import _extract_index_table
 
 # Relative margin below baseline a record must clear to be trusted.
 # A plan that merely "ties" the baseline is almost always an interrupted /
 # baseline-assigned record, so exclude it.
 _IMPROVE_EPS = 1e-3
+
+
+def _query_identity(query_digest: str, query_text: str) -> str:
+    """Stable identity for "the same query", used to aggregate records.
+
+    The source artifacts frequently lack a statement digest (only a few files
+    carry ``execution_info.query_digest``). Without a stable per-query key the
+    retriever's link-following (pick the best record of the same query) breaks,
+    treating every hint set as a different query.
+
+    Resolution order:
+      1. the real statement digest, if present;
+      2. otherwise a hash of the whitespace-normalized SQL text, prefixed with
+         ``qtext:`` so it can never be confused with a real digest.
+    """
+    digest = (query_digest or "").strip()
+    if digest:
+        return digest
+    norm = normalize_sql(query_text or "")
+    if not norm:
+        return ""
+    return "qtext:" + hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
 
 
 def _qconfig_id(query_digest: str, hints: List[str], plan_digest: Optional[str]) -> str:
@@ -115,7 +138,12 @@ def qconfigs_from_record(
         baseline = None
 
     execution_info = record.get("execution_info") if isinstance(record.get("execution_info"), dict) else {}
-    query_digest = str(execution_info.get("query_digest") or record.get("query_digest") or "")
+    # raw_digest = str(execution_info.get("query_digest") or record.get("query_digest") or "")
+    raw_digest = str("")  
+    # Resolve a stable query identity (real digest, or normalized-SQL hash when
+    # the source lacks a digest) so link-following can aggregate same-query
+    # records correctly.
+    query_digest = _query_identity(raw_digest, query)
     plan_cost = execution_info.get("accumulative_cost")
     try:
         plan_cost = float(plan_cost) if plan_cost is not None else None
