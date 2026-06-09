@@ -30,22 +30,26 @@ from mcts.utils.hint_utils import _extract_index_table
 _IMPROVE_EPS = 1e-3
 
 
-def _query_identity(query_digest: str, query_text: str) -> str:
+def query_identity(query_text: str) -> str:
+    """Public query-identity hash. See ``_query_identity``.
+
+    Online callers (the search) MUST use this — not the optimizer's statement
+    digest — so the key matches the offline store.
+    """
+    return _query_identity(query_text)
+
+
+def _query_identity(query_text: str) -> str:
     """Stable identity for "the same query", used to aggregate records.
 
-    The source artifacts frequently lack a statement digest (only a few files
-    carry ``execution_info.query_digest``). Without a stable per-query key the
-    retriever's link-following (pick the best record of the same query) breaks,
-    treating every hint set as a different query.
+    By design we IGNORE any statement digest supplied by the source artifacts
+    or the optimizer and always derive the identity from the whitespace-
+    normalized SQL text. This guarantees that the offline store and the online
+    search compute the *same* key for the same SQL, so retrieval / link-
+    following / write-back all agree regardless of whether a digest was present.
 
-    Resolution order:
-      1. the real statement digest, if present;
-      2. otherwise a hash of the whitespace-normalized SQL text, prefixed with
-         ``qtext:`` so it can never be confused with a real digest.
+    Returns a ``qtext:``-prefixed hash, or "" for empty SQL.
     """
-    digest = (query_digest or "").strip()
-    if digest:
-        return digest
     norm = normalize_sql(query_text or "")
     if not norm:
         return ""
@@ -138,12 +142,9 @@ def qconfigs_from_record(
         baseline = None
 
     execution_info = record.get("execution_info") if isinstance(record.get("execution_info"), dict) else {}
-    # raw_digest = str(execution_info.get("query_digest") or record.get("query_digest") or "")
-    raw_digest = str("")  
-    # Resolve a stable query identity (real digest, or normalized-SQL hash when
-    # the source lacks a digest) so link-following can aggregate same-query
-    # records correctly.
-    query_digest = _query_identity(raw_digest, query)
+    # Query identity is ALWAYS the normalized-SQL hash (we deliberately ignore
+    # any digest from the source / optimizer), so offline and online agree.
+    query_digest = _query_identity(query)
     plan_cost = execution_info.get("accumulative_cost")
     try:
         plan_cost = float(plan_cost) if plan_cost is not None else None
@@ -226,8 +227,9 @@ def qconfigs_from_result(
     """Extract trustworthy QConfigs from an in-memory MCTSSearchResult.
 
     Reuses the offline path by projecting the result into the record shape.
-    ``execution_info`` is not retained on the result, so query_digest is taken
-    from ``result.query_digest`` and plan_cost is left None.
+    The query identity is recomputed from the query text (the optimizer's
+    statement digest is deliberately ignored), so online write-back keys match
+    the offline store. plan_cost is left None.
     """
     if result is None:
         return []
@@ -244,7 +246,9 @@ def qconfigs_from_result(
     record = {
         "query": getattr(result, "query", "") or "",
         "baseline_time": getattr(result, "baseline_time_seconds", None),
-        "execution_info": {"query_digest": getattr(result, "query_digest", "") or ""},
+        # No execution_info: identity is recomputed from the query text by
+        # qconfigs_from_record (we ignore the optimizer's statement digest).
+        "execution_info": {},
         "index_info": {},
         "solutions": solutions,
     }

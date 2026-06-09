@@ -178,6 +178,27 @@ class MCTSSearch:
         if getattr(config, "rag_enabled", False):
             self._setup_rag()
 
+    def _resolve_store_path(self) -> str:
+        """Resolve the RAG store path robustly w.r.t. the working directory.
+
+        ``rag_store_path`` defaults to the relative ``mcts_scripts/rag_data/store``.
+        Absolute paths are used as-is. For relative paths we prefer anchoring at
+        the project root (the parent of the ``mcts`` package, i.e. the
+        aiopt_standalone dir) so the store is found regardless of the process
+        CWD; if that anchored path does not exist we fall back to the path as
+        given (relative to CWD), preserving the original behaviour.
+        """
+        import os
+        configured = self._config.rag_store_path
+        if os.path.isabs(configured):
+            return configured
+        # mcts/search.py -> mcts/ -> project root
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        anchored = os.path.join(project_root, configured)
+        if os.path.exists(anchored):
+            return anchored
+        return configured
+
     def _setup_rag(self) -> None:
         """Load the RAG store + embedder and retrieve the per-query context once.
 
@@ -188,15 +209,17 @@ class MCTSSearch:
             from mcts.rag.store import RAGStore
             from mcts.rag.embedder import build_embedder
             from mcts.rag.retriever import Retriever
+            from mcts.rag.qconfig import query_identity
         except Exception as e:  # noqa: BLE001
             logger.warning(self._with_query_tag(f"[RAG] import failed, disabling RAG: {e}"))
             return
 
-        store = RAGStore.load(self._config.rag_store_path)
+        resolved_path = self._resolve_store_path()
+        store = RAGStore.load(resolved_path)
         if store is None or store.num_rows == 0:
             logger.warning(
                 self._with_query_tag(
-                    f"[RAG] store unavailable/empty at {self._config.rag_store_path}; RAG off"
+                    f"[RAG] store unavailable/empty at {resolved_path}; RAG off"
                 )
             )
             return
@@ -211,7 +234,10 @@ class MCTSSearch:
                 )
                 return
             retriever = Retriever(store, embedder)
-            exclude = None if self._config.rag_allow_self_retrieval else self._query_digest
+            # Use OUR normalized-SQL identity hash (not the optimizer's
+            # statement digest) so it matches the keys in the offline store.
+            self._query_identity = query_identity(self._input.query)
+            exclude = None if self._config.rag_allow_self_retrieval else self._query_identity
             self._rag_context = retriever.retrieve(
                 self._input.query,
                 self._parse_execution_info(),
@@ -243,6 +269,77 @@ class MCTSSearch:
         if isinstance(ii, dict):
             return [str(t) for t in ii.keys()]
         return []
+
+    def _warm_start_from_rag(self) -> None:
+        """Seed the root with DB-validated children from retrieved hint bundles.
+
+        Each retrieved historical hint bundle becomes one root child with A5
+        (rethink) semantics — A5 uses its own hints as a complete, fresh
+        combination and stays expandable, which matches replaying a full
+        historical bundle. The children are filled WITHOUT an LLM call, then run
+        through the same DB execution + backpropagation as any node, so a stale
+        bundle simply becomes a low-reward branch that PUCT abandons (this is
+        exactly Booster's "seed, then let the search refine / discard").
+
+        Best-effort: any failure logs and leaves the tree untouched.
+        """
+        try:
+            refs = self._rag_context.refs if self._rag_context else []
+            if not refs:
+                return
+
+            # Build unique hint bundles from the references.
+            seen = set()
+            bundles: List[List[str]] = []
+            for ref in refs:
+                hints = deduplicate_hints(list(ref.qconfig.executed_hints or []))
+                if not hints:
+                    continue
+                key = tuple(hints)
+                if key in seen:
+                    continue
+                seen.add(key)
+                bundles.append(hints)
+            if not bundles:
+                return
+
+            # One A5 child per bundle, attached to the root.
+            children = create_child_nodes(
+                self._root,
+                [ActionType.A5_RETHINK] * len(bundles),
+                rollout_index=0,
+                c_puct=self._config.c_puct,
+            )
+            self._root.status = NodeStatus.EXPANDED
+
+            for child, hints in zip(children, bundles):
+                child.state.action_type = child.action_type
+                child.state.parsed_output = ParsedLLMOutput(
+                    raw_text="", hints=list(hints), is_continue_thinking=False
+                )
+                child.state.llm_response_text = (
+                    "[RAG warm-start] replay historical improving hint bundle"
+                )
+                # A5 uses its own hints as the full combination (no ancestors at
+                # the root anyway). Mark them all as new_hints so the node is
+                # executed by _execute_children.
+                child.state.new_hints = list(hints)
+                child.state.deleted_hints = []
+                child.state.executed_hints = list(hints)
+
+            logger.info(
+                self._with_query_tag(
+                    f"[RAG] warm-start: seeding {len(children)} root child(ren) "
+                    f"from retrieved bundles"
+                )
+            )
+
+            # Validate against the DB and backpropagate, reusing the normal path.
+            self._execute_children(children)
+            self._backpropagate_children(children)
+            self._plan_cache.finalize_stats(self._root)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(self._with_query_tag(f"[RAG] warm-start failed: {e}"))
 
     def _compute_query_digest(self) -> Optional[str]:
         """Compute the statement digest of the (hint-free) query, best-effort."""
@@ -284,6 +381,11 @@ class MCTSSearch:
         # the no-hint measurement through ``DBExecutor.execute_and_measure``).
         # No baseline measurement is performed here — both the in-memory
         # MemoryPlanCache and the query timeout were configured in __init__.
+
+        # RAG warm-start: seed the root with DB-validated children built from
+        # retrieved historical hint bundles before normal rollouts begin.
+        if getattr(self._config, "rag_warm_start", False) and self._rag_context is not None:
+            self._warm_start_from_rag()
 
         for rollout_idx in range(self._config.iterations):
             logger.info(self._with_query_tag(f"--- Rollout {rollout_idx + 1}/{self._config.iterations} ---"))
@@ -335,7 +437,7 @@ class MCTSSearch:
         else:
             logger.info(self._with_query_tag("[MCTS] No solutions found"))
 
-        return MCTSSearchResult(
+        result = MCTSSearchResult(
             query=self._input.query,
             query_digest=self._query_digest,
             baseline_time_seconds=self._input.baseline_time_seconds,
@@ -347,6 +449,91 @@ class MCTSSearch:
             early_stopping_metrics=self._plan_cache.to_early_stopping_metrics(),
             explain_analyze_info=build_explain_analyze_info(self._root),
         )
+
+        # RAG online write-back: append this search's improving solutions to
+        # the store so future searches can retrieve them. Gated + best-effort.
+        if getattr(self._config, "rag_write_back", False):
+            self._maybe_write_back(result)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # RAG online write-back
+    # ------------------------------------------------------------------
+
+    def _maybe_write_back(self, result: "MCTSSearchResult") -> None:
+        """Append improving solutions from this search into the RAG store.
+
+        Best-effort: any failure logs a warning and is swallowed so write-back
+        never affects the search result. Uses the same store path as retrieval;
+        if the store/embedder weren't loaded (RAG off, or load failed), it loads
+        them lazily here so write-back works even when retrieval was skipped.
+        """
+        try:
+            from mcts.rag.store import RAGStore
+            from mcts.rag.embedder import build_embedder
+            from mcts.rag.qconfig import qconfigs_from_result
+            from mcts.rag.schematic import build_schematics, anonymize_sql
+        except Exception as e:  # noqa: BLE001
+            logger.warning(self._with_query_tag(f"[RAG] write-back import failed: {e}"))
+            return
+
+        qcs = qconfigs_from_result(
+            result,
+            min_reward=0.0,
+            max_per_query=self._config.rag_top_k * 4 if self._config.rag_top_k else 8,
+        )
+        if not qcs:
+            logger.info(self._with_query_tag("[RAG] write-back: no improving solutions to store"))
+            return
+
+        try:
+            import os
+            resolved_path = self._resolve_store_path()
+            embedder = self._rag_embedder or build_embedder(self._config)
+            store = self._rag_store or RAGStore.load(resolved_path)
+            if store is None:
+                # No existing store — create a fresh one matching the embedder.
+                # Write it under the project-root-anchored path when the config
+                # path is relative, so it lands in a stable, predictable place.
+                dim = embedder.dim or embedder.encode_one("probe").shape[0]
+                store = RAGStore(dim=dim, embedder_name=embedder.name)
+                if not os.path.isabs(self._config.rag_store_path):
+                    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    resolved_path = os.path.join(project_root, self._config.rag_store_path)
+            if embedder.dim and store.dim and embedder.dim != store.dim:
+                logger.warning(
+                    self._with_query_tag(
+                        f"[RAG] write-back skipped: embedder dim {embedder.dim} "
+                        f"!= store dim {store.dim}"
+                    )
+                )
+                return
+
+            tables = self._tables_from_index_info()
+            execution_info = self._parse_execution_info()
+            rows = []
+            for qc in qcs:
+                if not qc.query_template:
+                    qc.query_template = anonymize_sql(qc.query_text)
+                schs = build_schematics(qc.query_text, execution_info, tables or qc.tables)
+                texts = [s.text for s in schs.values()]
+                stypes = list(schs.keys())
+                vecs = embedder.encode(texts)
+                for i, stype in enumerate(stypes):
+                    rows.append((qc, stype, vecs[i]))
+
+            added = store.upsert(rows)
+            store.save(resolved_path)
+            logger.info(
+                self._with_query_tag(
+                    f"[RAG] write-back: stored {len(qcs)} qconfig(s), "
+                    f"{added} new row(s); store now rows={store.num_rows} "
+                    f"qconfigs={store.num_qconfigs}"
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(self._with_query_tag(f"[RAG] write-back failed: {e}"))
 
     # ------------------------------------------------------------------
     # Single rollout
