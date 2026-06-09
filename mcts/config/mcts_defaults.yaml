@@ -1,0 +1,36 @@
+# mcts 配置文件
+# 此文件定义 mcts 搜索引擎的所有可调参数
+# 优先级: TOML [mcts] section > 此 YAML 文件 > MCTSConfig 内置默认值
+
+# --- LLM 参数 ---
+# llm_api_url_key 从 TOML [mcts] section 读取，此处不重复配置
+temperature: 1.0
+top_p: 0.8
+top_k: 40
+max_tokens: 1048576
+repetition_penalty: 1
+stop_tokens: ["</step>", "</answer>"]
+# 透传给 LLM 请求体的 chat_template_kwargs。常见用法：
+#   - Qwen3 / Deepseek-R1 等 thinking 模型：{enable_thinking: false} 关闭 CoT 草稿
+#   - 留空 {} 即不附带该字段
+chat_template_kwargs:
+  enable_thinking: false
+
+# --- 搜索参数 ---
+# max_depth 从 TOML [mcts] section 读取
+# iterations 从 TOML [mcts] section 读取
+c_puct: 2.5
+negative_reward: -1.0
+timeout_amplifier: 1.0
+
+# --- 提前结束 ---
+# plan_time_threshold_seconds 从 TOML 读取
+# estimated_tokens_budget 从 TOML 读取
+
+# --- API 重试 ---
+tpm_rate_limit_max_retries: 100
+api_cooldown_seconds: 30.0
+api_all_failed_wait_seconds: 60.0
+
+# --- 其他 ---
+max_execution_info_chars: 131072    # 128 * 1024

@@ -1,0 +1,3 @@
+# Local configuration files (not tracked by git)
+aiopt_conf.ini
+aiopt_conf.toml

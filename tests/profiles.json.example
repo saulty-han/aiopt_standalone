@@ -1,0 +1,54 @@
+{
+    "ncdb-spm": {
+        "env_type": "clone",
+        "env_config": {
+            "node_ip": "127.0.0.1",
+            "node_port": 13000,
+            "node_uuid": "ncdb-test-node-uuid",
+            "username": "tencentroot",
+            "password": ""
+        },
+        "instance_info": {
+            "instance_id": "test-ncdb-spm",
+            "cluster_id": 13000,
+            "product_type": "ncdb",
+            "node_uuid": "ncdb-test-node-uuid",
+            "workload_source": "awr_table",
+            "outline_type": "spm",
+            "region": "test"
+        },
+        "master_node": {
+            "node_ip": "127.0.0.1",
+            "node_port": 13000,
+            "node_uuid": "ncdb-test-node-uuid",
+            "username": "tencentroot",
+            "password": ""
+        }
+    },
+    "cdb-spm": {
+        "env_type": "clone",
+        "env_config": {
+            "node_ip": "127.0.0.1",
+            "node_port": 15430,
+            "node_uuid": "cdb-test-node-uuid",
+            "username": "tencentroot",
+            "password": ""
+        },
+        "instance_info": {
+            "instance_id": "test-cdb-spm",
+            "cluster_id": 15430,
+            "product_type": "cdb",
+            "node_uuid": "cdb-test-node-uuid",
+            "workload_source": "awr_table",
+            "outline_type": "spm",
+            "region": "test"
+        },
+        "master_node": {
+            "node_ip": "127.0.0.1",
+            "node_port": 15430,
+            "node_uuid": "cdb-test-node-uuid",
+            "username": "tencentroot",
+            "password": ""
+        }
+    }
+}
