@@ -471,8 +471,14 @@ def build_action_prompt(
     index_info: Dict[str, Any],
     partial_solution: str,
     step_number: int,
+    rag_refs: Any = None,
 ) -> str:
     """Build the complete prompt for a single action step.
+
+    Args:
+        rag_refs: optional RagContext (mcts.rag.types.RagContext) with retrieved
+            historical references. When None / empty, the prompt is identical to
+            the pre-RAG prompt — so RAG-off behaviour is unchanged.
 
     Returns:
         The full prompt string ready to send to the LLM.
@@ -489,4 +495,62 @@ def build_action_prompt(
         partial_solution=partial_solution,
         step_number=step_number,
     )
+
+    rag_section = _format_rag_refs(rag_refs, action)
+    if rag_section:
+        prompt = prompt + "\n\n" + rag_section
     return prompt
+
+
+# Hint-type prefixes relevant to each action, so the historical-reference block
+# only surfaces hints the current action can actually use.
+_ACTION_HINT_PREFIXES: Dict[ActionType, Tuple[str, ...]] = {
+    ActionType.A1_INDEX: ("INDEX(", "NO_INDEX("),
+    ActionType.A2_JOIN: ("JOIN_PREFIX(", "JOIN_SUFFIX("),
+    ActionType.A3_CONFIG: ("SET_VAR(",),
+}
+
+
+def _format_rag_refs(rag_refs: Any, action: ActionType) -> str:
+    """Render retrieved historical references as a prompt section.
+
+    Returns an empty string when there is nothing to inject (rag_refs is None /
+    empty, or no hint in the references is relevant to this action), so the
+    prompt is byte-for-byte unchanged whenever RAG yields nothing.
+
+    The block is explicitly framed as advisory (参考、非强制) to avoid the model
+    blindly copying historical hints that may not fit the current plan.
+    """
+    refs = getattr(rag_refs, "refs", None)
+    if not refs:
+        return ""
+
+    # For A1-A3, only show hints of the matching type; A4-A6 may see all.
+    prefixes = _ACTION_HINT_PREFIXES.get(action)
+
+    lines: List[str] = []
+    for ref in refs:
+        qc = getattr(ref, "qconfig", None)
+        if qc is None:
+            continue
+        hints = list(getattr(qc, "executed_hints", []) or [])
+        if prefixes:
+            hints = [h for h in hints if h.strip().upper().startswith(prefixes)]
+        if not hints:
+            continue
+        sim = getattr(ref, "similarity", 0.0) or 0.0
+        impr = getattr(qc, "improvement_ratio", None)
+        impr_txt = f"，历史加速约{impr:.1f}x" if isinstance(impr, (int, float)) and impr > 0 else ""
+        lines.append(f"- [相似度{sim:.2f}{impr_txt}] {' '.join(hints)}")
+
+    if not lines:
+        return ""
+
+    return (
+        "<历史参考>\n"
+        "以下是与当前查询结构相似的历史查询中，曾真实带来执行时间下降的 Hint 组合，"
+        "仅供参考。请结合当前执行计划判断是否适用，不要盲目照搬；"
+        "最终仍须从 <候选Hints> 中选择。\n"
+        + "\n".join(lines)
+        + "\n</历史参考>"
+    )

@@ -1,0 +1,3 @@
+# Generated RAG store artifacts (Phase I offline build output).
+# The build script (rag_build/build_store.py) is tracked; its output is not.
+rag_data/

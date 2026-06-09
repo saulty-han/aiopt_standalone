@@ -326,3 +326,28 @@ class MCTSConfig(BaseModel):
     # Wall-clock timeout (seconds) for the cheap EXPLAIN calls used to obtain a
     # plan digest (never EXPLAIN ANALYZE). Default 30.
     explain_timeout_seconds: float = 30.0
+
+    # ---- RAG (Booster-style retrieval augmentation) ----
+    # All RAG behaviour is gated by ``rag_enabled``. When False (default), the
+    # search behaves exactly as before and never touches the RAG subsystem.
+    rag_enabled: bool = False
+    # Store directory produced by mcts_scripts/rag_build/build_store.py.
+    rag_store_path: str = "mcts_scripts/rag_data/store"
+    # Embedder selection: "local" (deterministic, dependency-free fallback) or
+    # "api" (external embedding service — requires rag_embedder_api_url).
+    rag_embedder: str = "local"
+    rag_embedder_dim: int = 256
+    rag_embedder_api_url: Optional[str] = None
+    rag_embedder_api_key: Optional[str] = None
+    rag_embedder_model: Optional[str] = None
+    # Retrieval knobs. top_k follows Booster's default of 2.
+    rag_top_k: int = 2
+    rag_min_similarity: float = 0.5
+    # When True, allow retrieving the target query's own historical records
+    # (useful for exact-transfer / warm-start). When False, same-query records
+    # are excluded so only cross-query experience is injected.
+    rag_allow_self_retrieval: bool = True
+    # Online write-back: append this search's improving solutions to the store.
+    rag_write_back: bool = False
+    # Layer 2: seed the search tree from retrieved historical hints.
+    rag_warm_start: bool = False

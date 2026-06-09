@@ -169,6 +169,81 @@ class MCTSSearch:
         # Register the baseline (digest, time) into the in-memory plan cache.
         self._plan_cache.init_baseline(baseline_digest, baseline_time)
 
+        # RAG (Booster-style retrieval augmentation). Inert unless enabled.
+        # Built best-effort: any failure logs and degrades to no-RAG so the
+        # search always proceeds.
+        self._rag_store = None
+        self._rag_embedder = None
+        self._rag_context = None
+        if getattr(config, "rag_enabled", False):
+            self._setup_rag()
+
+    def _setup_rag(self) -> None:
+        """Load the RAG store + embedder and retrieve the per-query context once.
+
+        Called only when ``config.rag_enabled``. The retrieved context is reused
+        across the entire tree (Phase II retrieval is per-query, not per-step).
+        """
+        try:
+            from mcts.rag.store import RAGStore
+            from mcts.rag.embedder import build_embedder
+            from mcts.rag.retriever import Retriever
+        except Exception as e:  # noqa: BLE001
+            logger.warning(self._with_query_tag(f"[RAG] import failed, disabling RAG: {e}"))
+            return
+
+        store = RAGStore.load(self._config.rag_store_path)
+        if store is None or store.num_rows == 0:
+            logger.warning(
+                self._with_query_tag(
+                    f"[RAG] store unavailable/empty at {self._config.rag_store_path}; RAG off"
+                )
+            )
+            return
+
+        try:
+            embedder = build_embedder(self._config)
+            if embedder.dim and store.dim and embedder.dim != store.dim:
+                logger.warning(
+                    self._with_query_tag(
+                        f"[RAG] embedder dim {embedder.dim} != store dim {store.dim}; RAG off"
+                    )
+                )
+                return
+            retriever = Retriever(store, embedder)
+            exclude = None if self._config.rag_allow_self_retrieval else self._query_digest
+            self._rag_context = retriever.retrieve(
+                self._input.query,
+                self._parse_execution_info(),
+                self._tables_from_index_info(),
+                top_k=self._config.rag_top_k,
+                min_similarity=self._config.rag_min_similarity,
+                exclude_query_digest=exclude,
+            )
+            self._rag_store = store
+            self._rag_embedder = embedder
+            n = len(self._rag_context.refs) if self._rag_context else 0
+            logger.info(self._with_query_tag(f"[RAG] retrieved {n} reference(s) for this query"))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(self._with_query_tag(f"[RAG] retrieval failed, disabling RAG: {e}"))
+            self._rag_context = None
+
+    def _parse_execution_info(self):
+        """Parse the input execution_info_json into a dict (best-effort)."""
+        import json as _json
+        try:
+            data = _json.loads(self._input.execution_info_json or "{}")
+            return data if isinstance(data, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _tables_from_index_info(self):
+        """Referenced table names from index_info keys (best-effort)."""
+        ii = self._input.index_info
+        if isinstance(ii, dict):
+            return [str(t) for t in ii.keys()]
+        return []
+
     def _compute_query_digest(self) -> Optional[str]:
         """Compute the statement digest of the (hint-free) query, best-effort."""
         try:
@@ -361,6 +436,7 @@ class MCTSSearch:
                 index_info=self._input.index_info,
                 partial_solution=partial,
                 step_number=child.depth,
+                rag_refs=self._rag_context,
             )
             prompts.append((child, prompt))
 
